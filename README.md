@@ -1,5 +1,11 @@
 # Async Payment Processing
 
+> Привет ревьюер у вас хорошее максимальное подробное ТЗ, hr сказала потратить на эту задачу пару часов поэтому я закинул это в нейронку. Ручками по чистой архитектуре так быстро не справиться
+
+Асинхронный микросервис процессинга платежей: **FastAPI + Pydantic v2 + SQLAlchemy 2.0 (async) + PostgreSQL + RabbitMQ (aio-pika) + Alembic**, запуск через Docker Compose.
+
+Сервис принимает запланированную оплату по HTTP, идемпотентно сохраняет её вместе с событием Outbox в одной транзакции и асинхронно обрабатывает через эмулятор внешнего шлюза. Итог фиксируется в терминальном статусе и доставляется клиенту по webhook; повторы ограничены бюджетом попыток, незавершённая работа уходит в Dead Letter Queue.
+
 [![CI](https://github.com/georgehuble/nebus_test/actions/workflows/ci.yml/badge.svg)](https://github.com/georgehuble/nebus_test/actions/workflows/ci.yml)
 [![Publish container image](https://github.com/georgehuble/nebus_test/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/georgehuble/nebus_test/actions/workflows/docker-publish.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -9,82 +15,81 @@
 [![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](docker-compose.yml)
 
-Асинхронный микросервис процессинга платежей: **FastAPI + Pydantic v2 + SQLAlchemy 2.0 (async) +
-PostgreSQL + RabbitMQ (aio-pika) + Alembic**, запускаемый через Docker Compose.
-
-Сервис принимает запланированную оплату по HTTP, идемпотентно сохраняет её вместе с исходным
-событием Outbox в одной транзакции и асинхронно обрабатывает через эмулятор внешнего платёжного
-шлюза. Итог фиксируется в терминальном статусе и доставляется клиенту по webhook. Повторы
-ограничены бюджетом попыток, а незавершённая работа уходит в Dead Letter Queue.
-
 ---
 
-## 1. Архитектура
-
-Слои приложения (`app/`):
-
-| Слой | Содержимое |
-|---|---|
-| `api/` | FastAPI-приложение, роутеры, схемы, dependency проверки `X-API-Key` |
-| `application/` | Сценарии: создание платежа, чтение, обработка сообщения (`PaymentProcessor`) |
-| `domain/` | DTO, событие `payment.created`, состояния, webhook payload, отпечаток |
-| `infrastructure/` | SQLAlchemy-модели и репозитории, Outbox relay, retry dispatcher, publisher, webhook-клиент |
-| `gateway/` | Детерминированный эмулятор внешнего шлюза |
-| `consumer/` | Цикл обработчика сообщений и readiness consumer-процесса |
-
-Заменяемые зависимости описаны узкими `Protocol` (`PaymentGateway`, `WebhookSender`,
-`RandomSource`, `Clock`, `Sleeper`, `EventPublisher`) и внедряются через конструктор.
-Композиционный корень — `app/container.py`.
-
-Поток обработки:
-
-```
-POST /api/v1/payments
-        │  одна транзакция: payments(pending) + outbox(payment.created)
-        ▼
-   Outbox relay (фон, в процессе consumer)
-        │  publisher confirm + mandatory routing
-        ▼
-   RabbitMQ: exchange payments → queue payments.new (quorum)
-        ▼
-   Consumer: claim (lease) → попытка → эмулятор шлюза → терминальный статус
-        │                                              → webhook → сохранение доставки → ack
-        ▼
-   При технической ошибке: durable retry в БД (attempt_state='awaiting_retry')
-        │  retry dispatcher → publisher confirm → повторная публикация с x-attempt
-        ▼
-   Бюджет попыток исчерпан → exchange payments.dlx → queue payments.new.dlq (quorum)
-```
-
----
-
-## 2. Требования
-
-- Docker Engine 24+ и Docker Compose v2
-- (для локальных проверок кода) [uv](https://docs.astral.sh/uv/) — Python 3.12 ставится автоматически
-
----
-
-## 3. Быстрый старт
+## Запуск
 
 ```bash
-# 1. Конфигурация окружения
-cp .env.example .env        # при необходимости измените значения
-
-# 2. Инфраструктура (PostgreSQL + RabbitMQ) и ожидание healthchecks
-docker compose up -d --wait postgres rabbitmq
-
-# 3. Применение миграций — ЕДИНСТВЕННЫЙ шаг миграций
-docker compose run --rm api alembic upgrade head
-
-# 4. Приложение
-docker compose up -d --build api consumer
-
-# 5. Состояние
-docker compose ps           # все четыре сервиса должны быть healthy
+cp .env.example .env                                  # конфигурация окружения
+docker compose up -d --wait postgres rabbitmq         # инфраструктура + healthchecks
+docker compose run --rm api alembic upgrade head      # миграции
+docker compose up -d --build api consumer             # приложение
+docker compose ps                                     # все сервисы должны быть healthy
 ```
 
-`api` слушает `http://localhost:8000`, `consumer` — внутренний HTTP для readiness
+`api` — `http://localhost:8000`. PostgreSQL и RabbitMQ публикуются на порты `15432` и `15673`, чтобы не конфликтовать с локальными сервисами.
+
+Остановка: `docker compose down` (данные сохраняются) или `docker compose down -v` (чистое состояние).
+
+## Конфигурация
+
+Настройки читаются из окружения (`.env`). Обязательные переменные: `API_KEY`, `DATABASE_URL`, `RABBITMQ_URL` — при их отсутствии сервис падает на старте. Остальные параметры (`MAX_ATTEMPTS=3`, `MAX_RECOVERIES=5`, `RETRY_BASE_DELAY_SECONDS=1.0`, `ATTEMPT_LEASE_SECONDS=15.0`, `WEBHOOK_TIMEOUT_SECONDS=10.0`, `LOG_LEVEL=INFO` и др.) имеют значения по умолчанию — полный список в [`app/settings.py`](app/settings.py).
+
+## HTTP API
+
+Все маршруты требуют заголовок `X-API-Key`. Служебные `/docs`, `/redoc` и `/openapi.json` отключены; контракт доступен по защищённому `GET /api/v1/openapi.json`.
+
+```bash
+export API_KEY=dev-api-key-change-me
+BASE=http://localhost:8000
+
+# создание платежа (202 Accepted после commit транзакции)
+curl -sS -X POST "$BASE/api/v1/payments" \
+  -H "X-API-Key: $API_KEY" -H "Idempotency-Key: demo-key-1" \
+  -H "Content-Type: application/json" \
+  -d '{"amount":"10.50","currency":"RUB","description":"Заказ 42",
+       "metadata":{"order_id":"42"},
+       "webhook_url":"http://host.docker.internal:9000/hook"}'
+
+# чтение платежа
+curl -sS "$BASE/api/v1/payments/<payment_id>" -H "X-API-Key: $API_KEY"
+
+# health
+curl -sS "$BASE/api/v1/health" -H "X-API-Key: $API_KEY"
+```
+
+Лимиты: `amount` — строка `> 0` с не более 2 знаками после запятой (до `999999999.99`); `currency` — `RUB`/`USD`/`EUR`; `description` — до 500 символов; `metadata` — до 16 KiB канонического JSON; `webhook_url` — абсолютный `http`/`https` URL. Повтор с тем же `Idempotency-Key` и телом возвращает тот же платёж (`202`), с другим телом — `409`. Коды чтения: `200`, `404`, `422`, `401`.
+
+## Архитектура
+
+Слои в `app/`: `api/` (FastAPI, роутеры, схемы, проверка `X-API-Key`), `application/` (сценарии и `PaymentProcessor`), `domain/` (DTO, события, состояния, webhook payload), `infrastructure/` (SQLAlchemy-модели и репозитории, Outbox relay, retry dispatcher, webhook-клиент), `gateway/` (детерминированный эмулятор шлюза), `consumer/` (цикл обработчика, readiness). Заменяемые зависимости описаны `Protocol` и внедряются через конструктор; композиционный корень — [`app/container.py`](app/container.py).
+
+```
+POST /api/v1/payments ──► одна транзакция: payments(pending) + outbox(payment.created)
+Outbox relay ──► RabbitMQ payments.new ──► Consumer: lease → шлюз → терминальный статус → webhook → ack
+Техническая ошибка ──► durable retry в БД ──► повторная публикация с x-attempt
+Бюджет исчерпан ──► payments.new.dlq
+```
+
+- **Гарантии — at-least-once, не exactly-once**: возможны повторы публикации и webhook-доставки. Consumer идемпотентен по `event_id`; получатель webhook дедуплицирует по `event_id` (UUIDv5, стабильный между рестартами).
+- **Захват попытки**: lease с продлением heartbeat, fencing через `attempt_epoch`; takeover не расходует бюджет.
+- **Retry** планируется в БД (`next_attempt_at`, задержки 1 с и 2 с) и публикуется dispatcher'ом с заголовком `x-attempt`.
+- Незавершённая работа после исчерпания бюджета/лимита recovery уходит в `payments.new.dlq` (quorum-очереди, без плагинов).
+- Webhook: `POST` на `webhook_url`, успех — только `2xx`, redirects не следуются. Для получателя на хосте используйте `http://host.docker.internal:<PORT>/hook` (внутри контейнера `localhost` указывает на сам consumer).
+
+## Проверки
+
+```bash
+make check         # ruff lint + ruff format --check + mypy (strict) + unit-тесты
+make integration   # реальные PostgreSQL и RabbitMQ: integration + e2e
+make coverage      # покрытие ветвей и строк
+```
+
+`pytest -m unit` не требует инфраструктуры; `pytest -m integration` и `pytest -m e2e` работают на реальных PostgreSQL и RabbitMQ (SQLite и моки брокера не используются). CI ([`ci.yml`](.github/workflows/ci.yml)) запускает качество, unit-, integration-тесты и сборку Docker-образа; пуш тега `vX.Y.Z` публикует образ в GHCR ([`docker-publish.yml`](.github/workflows/docker-publish.yml)).
+
+## Структура
+
+```
 (`http://localhost:8001` внутри контейнера; наружу порт не публикуется).
 
 Остановка и очистка:
