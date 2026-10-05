@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/georgehuble/nebus_test/security/advisories/new
+    about: Please report security issues privately, not in the public issue tracker.
+  - name: Questions & discussions
+    url: https://github.com/georgehuble/nebus_test/discussions
+    about: Ask questions and discuss ideas with the community.

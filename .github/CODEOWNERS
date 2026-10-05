@@ -1,0 +1,12 @@
+# Default owners for everything in the repository.
+* @georgehuble
+
+# Security-sensitive paths.
+/.github/workflows/ @georgehuble
+/SECURITY.md @georgehuble
+/.env.example @georgehuble
+
+# Core service logic.
+/app/application/ @georgehuble
+/app/domain/ @georgehuble
+/app/infrastructure/ @georgehuble

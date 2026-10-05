@@ -1,0 +1,88 @@
+name: async-payment-processing
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    ports:
+      - "${POSTGRES_HOST_PORT:-15432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "${RABBITMQ_HOST_PORT:-15673}:5672"
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build: .
+    command:
+      ["uvicorn", "app.api.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+    environment: &app_env
+      API_KEY: "${API_KEY:-dev-api-key-change-me}"
+      DATABASE_URL: "postgresql+asyncpg://payments:payments@postgres:5432/payments"
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'curl -fsS -H "X-API-Key: $${API_KEY}" http://localhost:8000/api/v1/health || exit 1'
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    stop_grace_period: 15s
+
+  consumer:
+    build: .
+    command:
+      ["uvicorn", "app.consumer.main:create_consumer_app", "--factory", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      <<: *app_env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'curl -fsS -H "X-API-Key: $${API_KEY}" http://localhost:8001/api/v1/health || exit 1'
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    stop_grace_period: 15s
+
+volumes:
+  pgdata:
+  rabbitdata:
