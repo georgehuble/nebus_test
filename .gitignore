@@ -16,3 +16,7 @@ htmlcov/
 *.log
 .idea/
 .vscode/
+
+# Local AI-assistant / editor tooling (Roo Code commands and skills); not part
+# of the service and should not be published.
+.roo/
